@@ -244,6 +244,87 @@ class ROV:
         """全通道回中"""
         self.set_raw(0, 0, 0, 0, 0)
 
+    # ── 水泵控制 ───────────────────────────────────────────
+
+    def pump(self, num, state=True):
+        """控制水泵 1-4 (0-based relay)"""
+        if self.mav is None:
+            return
+        self.mav.mav.command_long_send(config.SYSID, config.COMPID,
+            mavutil.mavlink.MAV_CMD_DO_SET_RELAY, 0,
+            num - 1, 1 if state else 0, 0, 0, 0, 0, 0)
+
+    def pump_inlets(self, state):
+        """入水泵 (1,3): 下潜时进水"""
+        self.pump(config.PUMP_INLET1, state)
+        self.pump(config.PUMP_INLET2, state)
+        if state:
+            print("💧 入水泵 ON")
+        else:
+            print("💧 入水泵 OFF")
+
+    def pump_drains(self, state):
+        """排水泵 (2,4): 上浮时排水（仅深度<阈值时有效）"""
+        depth = self.get_depth()
+        if state and depth < -config.PUMP_DEPTH_THRESHOLD:
+            print(f"⚠️ 深度 {depth:.1f}m，气孔未露出，不启动排水泵")
+            return
+        self.pump(config.PUMP_DRAIN1, state)
+        self.pump(config.PUMP_DRAIN2, state)
+        if state:
+            print("💧 排水泵 ON")
+        else:
+            print("💧 排水泵 OFF")
+
+    def pumps_all_off(self):
+        for i in range(1, 5):
+            self.pump(i, False)
+        print("💧 所有水泵 OFF")
+
+    # ── 深度控制（含泵协同） ────────────────────────────────
+
+    def hold_depth(self, target_m, duration=None):
+        """定深，带泵协同（下潜入水时自动启停入水泵）"""
+        self.pid_depth.set_setpoint(target_m)
+
+        # 下潜时启动入水泵
+        if target_m < self.get_depth():
+            self.pump_inlets(True)
+
+        deadline = time.time() + duration if duration else float('inf')
+        while time.time() < deadline:
+            current = self.get_depth()
+            # 深度足够深时关闭入水泵
+            if target_m < 0 and current < target_m + 0.5:
+                self.pump_inlets(False)
+            vertical = self.pid_depth.update(current, config.CONTROL_DT)
+            self.set_raw(vertical=vertical)
+            time.sleep(config.CONTROL_DT)
+        self.pump_inlets(False)
+
+    # ── 紧急上浮 ───────────────────────────────────────────
+
+    def emergency_surface(self):
+        """紧急上浮：翻正 → 垂直上升 → 近水面排水 → 到达水面"""
+        print("🚨 紧急上浮!")
+        self.update_flip_state()
+        if self.flip_state == config.FlipState.INVERTED:
+            self.roll_to_normal()
+
+        # 全力上升
+        self.set_raw(vertical=1.0)
+        for _ in range(50):  # 约 5 秒
+            depth = self.get_depth()
+            # 近水面时开排水泵
+            if depth > -config.PUMP_DEPTH_THRESHOLD:
+                self.pump_drains(True)
+            time.sleep(config.CONTROL_DT)
+
+        self.set_mode(config.RovMode.SURFACE)
+        self.stop()
+        self.pumps_all_off()
+        print("✅ 已上浮")
+
     # ── 高层命令 ───────────────────────────────────────────
 
     def arm(self, retries=3):

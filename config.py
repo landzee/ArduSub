@@ -42,6 +42,13 @@ PID_DEPTH_I   = 0.02
 PID_DEPTH_D   = 0.1
 PID_DEPTH_FF  = 0.0     # 前馈（浮力补偿）
 
+# ---- 水泵 ----
+PUMP_INLET1  = 1  # 进水1 → pump(1)
+PUMP_INLET2  = 3  # 进水2 → pump(3)
+PUMP_DRAIN1  = 2  # 排水1 → pump(2)
+PUMP_DRAIN2  = 4  # 排水2 → pump(4)
+PUMP_DEPTH_THRESHOLD = 0.3  # 米：排水泵在此深度以下不工作（气孔未露出）
+
 PID_ROLL_P    = 0.5
 PID_ROLL_I    = 0.01
 PID_ROLL_D    = 0.05
