@@ -1,0 +1,14 @@
+# 虚拟环境
+.venv/
+venv/
+myenv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统
+.DS_Store
+Thumbs.db
