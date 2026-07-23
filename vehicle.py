@@ -48,6 +48,9 @@ class ROV:
         # 姿态校准偏移（启动时记下，后续 get_attitude 自动减去）
         self._att_offset = {'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0}
 
+        # 深度基准（启动时自动记录水面气压）
+        self._surface_pressure = 1013.0
+
     # ── 连接 ────────────────────────────────────────────────
 
     def connect(self, port=config.PORT, baud=config.BAUD):
@@ -94,6 +97,8 @@ class ROV:
                     self.sensors['rollspeed'] = msg.rollspeed
                     self.sensors['pitchspeed'] = msg.pitchspeed
                     self.sensors['yawspeed'] = msg.yawspeed
+                    # 后台线程直接更新翻转状态（用原始roll）
+                    self._update_flip_inline(msg.roll)
                 elif t == 'SCALED_PRESSURE':
                     self.sensors['press_abs'] = msg.press_abs
                     self.sensors['press_diff'] = msg.press_diff
@@ -119,8 +124,8 @@ class ROV:
             return (r, p, y)
 
     def get_depth(self):
-        """返回深度（米）"""
-        return self.get_sensor('depth_m')
+        """返回深度（米）：负=水上，正=水下，校准后水面=0"""
+        return (self.get_sensor('press_abs') - self._surface_pressure) * 0.01
 
     def calibrate_attitude(self):
         """姿态置零：把当前姿态记作参考零点，纯软件偏移，不影响飞控"""
@@ -132,8 +137,13 @@ class ROV:
         self._att_offset['roll'] = self.get_sensor('roll')
         self._att_offset['pitch'] = self.get_sensor('pitch')
         self._att_offset['yaw'] = self.get_sensor('yaw')
+        # 校准深度零点
+        press = self.get_sensor('press_abs')
+        if press > 500:  # 有效值
+            self._surface_pressure = press
         print(f"✅ 姿态校准完成  offset: roll={self._att_offset['roll']*57.3:.1f}° "
               f"pitch={self._att_offset['pitch']*57.3:.1f}° yaw={self._att_offset['yaw']*57.3:.1f}°")
+        print(f"✅ 深度零点: {self._surface_pressure:.1f} hPa")
         # 重置 PID
         for pid in [self.pid_roll, self.pid_pitch, self.pid_yaw]:
             pid.reset()
@@ -141,20 +151,22 @@ class ROV:
 
     # ── 翻转检测 ───────────────────────────────────────────
 
-    def update_flip_state(self):
-        """根据 roll 更新翻转状态"""
-        roll_deg = self.get_sensor('roll') * 57.2958
-        thresh = config.FLIP_THRESHOLD_DEG
-        hyst = config.FLIP_HYSTERESIS
-
+    def _update_flip_inline(self, roll_rad):
+        """后台线程内直接更新翻转状态（已持锁，不另外拿锁）"""
+        roll_deg = roll_rad * 57.2958
         if self.flip_state == config.FlipState.NORMAL:
-            if abs(roll_deg) > thresh + hyst:
+            if abs(roll_deg) > config.FLIP_THRESHOLD_DEG + config.FLIP_HYSTERESIS:
                 self.flip_state = config.FlipState.INVERTED
                 print("🔄 检测到翻转 → INVERTED")
         else:
-            if abs(roll_deg) < thresh - hyst:
+            if abs(roll_deg) < config.FLIP_THRESHOLD_DEG - config.FLIP_HYSTERESIS:
                 self.flip_state = config.FlipState.NORMAL
                 print("🔄 恢复正常 → NORMAL")
+
+    def update_flip_state(self):
+        """手动更新翻转状态（供外部主动调用）"""
+        # 从缓存读 roll，已在 _update_flip_inline 里同步过了，这里留空接口
+        pass
 
     # ── 模式切换 ───────────────────────────────────────────
 
@@ -264,10 +276,10 @@ class ROV:
             print("💧 入水泵 OFF")
 
     def pump_drains(self, state):
-        """排水泵 (2,4): 上浮时排水（仅深度<阈值时有效）"""
+        """排水泵 (2,4): 上浮时排水（深度<0.1m气孔露出才启动）"""
         depth = self.get_depth()
-        if state and depth < -config.PUMP_DEPTH_THRESHOLD:
-            print(f"⚠️ 深度 {depth:.1f}m，气孔未露出，不启动排水泵")
+        if state and depth > config.PUMP_DRAIN_DEPTH:
+            print(f"⚠️ 深度 {depth:.2f}m > {config.PUMP_DRAIN_DEPTH}m，气孔未露出")
             return
         self.pump(config.PUMP_DRAIN1, state)
         self.pump(config.PUMP_DRAIN2, state)
@@ -284,23 +296,28 @@ class ROV:
     # ── 深度控制（含泵协同） ────────────────────────────────
 
     def hold_depth(self, target_m, duration=None):
-        """定深，带泵协同（下潜入水时自动启停入水泵）"""
+        """定深，带泵协同（0=水面, 正=水下深度）"""
         self.pid_depth.set_setpoint(target_m)
 
-        # 下潜时启动入水泵
-        if target_m < self.get_depth():
+        # 下潜：切水下模式 + 启动入水泵
+        if target_m > self.get_depth():
+            self.set_mode(config.RovMode.UNDERWATER)
             self.pump_inlets(True)
 
         deadline = time.time() + duration if duration else float('inf')
         while time.time() < deadline:
             current = self.get_depth()
-            # 深度足够深时关闭入水泵
-            if target_m < 0 and current < target_m + 0.5:
+            # 深度超过阈值时关闭入水泵
+            if current > config.PUMP_INLET_OFF_DEPTH:
                 self.pump_inlets(False)
             vertical = self.pid_depth.update(current, config.CONTROL_DT)
             self.set_raw(vertical=vertical)
             time.sleep(config.CONTROL_DT)
         self.pump_inlets(False)
+
+        # 接近水面自动切水面模式
+        if target_m < config.PUMP_DRAIN_DEPTH:
+            self.set_mode(config.RovMode.SURFACE)
 
     # ── 紧急上浮 ───────────────────────────────────────────
 
@@ -316,7 +333,7 @@ class ROV:
         for _ in range(50):  # 约 5 秒
             depth = self.get_depth()
             # 近水面时开排水泵
-            if depth > -config.PUMP_DEPTH_THRESHOLD:
+            if depth < config.PUMP_DRAIN_DEPTH:
                 self.pump_drains(True)
             time.sleep(config.CONTROL_DT)
 

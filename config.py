@@ -47,7 +47,8 @@ PUMP_INLET1  = 1  # 进水1 → pump(1)
 PUMP_INLET2  = 3  # 进水2 → pump(3)
 PUMP_DRAIN1  = 2  # 排水1 → pump(2)
 PUMP_DRAIN2  = 4  # 排水2 → pump(4)
-PUMP_DEPTH_THRESHOLD = 0.3  # 米：排水泵在此深度以下不工作（气孔未露出）
+PUMP_DRAIN_DEPTH   = 0.1   # 米：深度<此值，气孔露出，排水泵可工作
+PUMP_INLET_OFF_DEPTH = 0.3 # 米：深度>此值，入水泵关闭（进水够多了）
 
 PID_ROLL_P    = 0.5
 PID_ROLL_I    = 0.01
