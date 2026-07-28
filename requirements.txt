@@ -1,3 +1,4 @@
 pymavlink
 pyserial
 future
+opencv-python

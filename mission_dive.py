@@ -61,6 +61,12 @@ def hold_depth(target_m, duration=30):
             dy = 80 if abs(y_err)>20 else (50 if abs(y_err)>10 else 30)
             ch4 = int(1500 + s * dy)
 
+        # --- 模式自动切换 ---
+        if depth > PUMP_DRAIN_DEPTH and rov.rov_mode == RovMode.SURFACE:
+            rov.set_mode(RovMode.UNDERWATER)
+        if depth < PUMP_DRAIN_DEPTH and target_m < depth and rov.rov_mode == RovMode.UNDERWATER:
+            rov.set_mode(RovMode.SURFACE)
+
         # --- 水泵 ---
         if depth > PUMP_INLET_OFF_DEPTH and inlets_on:
             rov.pump_inlets(False); inlets_on = False

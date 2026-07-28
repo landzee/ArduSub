@@ -30,9 +30,11 @@ class PID:
     def set_setpoint(self, sp):
         self.setpoint = sp
 
-    def update(self, measured, dt):
+    def update(self, measured, dt, velocity=None):
         """PID 一步计算，返回控制量 [-1, 1]
-        d_on_meas=True: D=-kd*d(measured)/dt (避免设点突变冲击，适合水下)"""
+
+        velocity: 可选，EKF 滤波后的角速度/线速度。
+                  传入时 D 项直接用此值（跳过差分），适合水下惯性系统。"""
         error = self.setpoint - measured
 
         p_out = self.kp * error
@@ -41,15 +43,17 @@ class PID:
         self.integral = max(self.integral_min, min(self.integral_max, self.integral))
         i_out = self.ki * self.integral
 
-        if dt > 0:
+        if velocity is not None:
+            # 使用 EKF 滤波速度（干净），跳过差分
+            d_out = -self.kd * velocity
+        elif dt > 0:
             if self.d_on_meas:
-                # D 在测量值上：抑制实际运动，不响应设点跳变
                 derivative = -(measured - self.last_measured) / dt
             else:
                 derivative = (error - self.last_error) / dt
+            d_out = self.kd * derivative
         else:
-            derivative = 0.0
-        d_out = self.kd * derivative
+            d_out = 0.0
         self.last_error = error
         self.last_measured = measured
 
