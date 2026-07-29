@@ -48,7 +48,7 @@ PUMP_INLET2  = 3  # 进水2 → pump(3)
 PUMP_DRAIN1  = 2  # 排水1 → pump(2)
 PUMP_DRAIN2  = 4  # 排水2 → pump(4)
 PUMP_DRAIN_DEPTH   = 0.1   # 米：深度<此值，气孔露出，排水泵可工作
-PUMP_INLET_OFF_DEPTH = 0.3 # 米：深度>此值，入水泵关闭（进水够多了）
+PUMP_INLET_OFF_DEPTH = 0.1 # 米：深度>此值，入水泵关闭（进水够多了）
 
 PID_ROLL_P    = 0.5
 PID_ROLL_I    = 0.01
@@ -64,7 +64,7 @@ PID_YAW_D     = 0.05
 
 # ---- 深度 ----
 PRESSURE_AT_SURFACE = 1013  # 海平面气压 hPa，用于深度估算
-DEPTH_PER_HPA       = 0.01 # 1 hPa ≈ 1 cm
+DEPTH_PER_HPA       = 0.01  # 1 hPa ≈ 1 cm，读数偏小就调大
 
 # ---- 控制频率 ----
 CONTROL_HZ   = 20     # PID 更新频率

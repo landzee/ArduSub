@@ -66,3 +66,15 @@ Python → RC_CHANNELS_OVERRIDE → 飞控混控矩阵 → 推进器 PWM
 | CH2 (roll) | 右倾 | 左倾 |
 | CH1 (pitch) | 上抬 (RC1_REVERSED=1) | 下埋 |
 | CH4 (yaw) | 右转 | 左转 |
+
+### 翻转后轴映射
+
+船翻转 180° (|roll|>90°) 后，`ROV.set_raw()` 自动调整各轴方向：
+
+| 轴 | 正常 | 翻转后 | 原因 |
+|----|------|--------|------|
+| forward (ch5) | 正 | 不变 | 体 X 仍指向前 |
+| yaw (ch4) | 正 | **反号** | 体 Z 指向世界-Z |
+| throttle (ch3) | 正 | **反号** | 体 Z 指向世界+Z |
+| roll (ch2) | 正 | **反号** | 体 Y 指向世界-Y |
+| pitch (ch1) | 正 | **反号** | 体 X 广义反向 |

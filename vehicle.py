@@ -45,6 +45,10 @@ class ROV:
         self._reader_thread = None
         self._heartbeat_armed = False
 
+        # 排水循环线程（仅水面模式工作）
+        self._bilge_running = False
+        self._bilge_thread = None
+
         # 姿态校准偏移（启动时记下，后续 get_attitude 自动减去）
         self._att_offset = {'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0}
 
@@ -125,7 +129,7 @@ class ROV:
 
     def get_depth(self):
         """返回深度（米）：负=水上，正=水下，校准后水面=0"""
-        return (self.get_sensor('press_abs') - self._surface_pressure) * 0.01
+        return (self.get_sensor('press_abs') - self._surface_pressure) * config.DEPTH_PER_HPA
 
     def calibrate_attitude(self):
         """姿态置零：把当前姿态记作参考零点，纯软件偏移，不影响飞控"""
@@ -252,9 +256,27 @@ class ROV:
             config.SYSID, config.COMPID,
             ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7])
 
-    def stop(self):
-        """全通道回中"""
-        self.set_raw(0, 0, 0, 0, 0)
+    # ── 高层命令 ───────────────────────────────────────────
+
+    def arm(self, retries=3):
+        if self.mav is None: return False
+        for _ in range(retries):
+            self.mav.mav.command_long_send(config.SYSID, config.COMPID,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0,0,0,0,0,0)
+            time.sleep(2)
+            if self._heartbeat_armed:
+                self.armed = True
+                print("✅ 已解锁")
+                return True
+        print("❌ 解锁失败")
+        return False
+
+    def disarm(self):
+        if self.mav is None: return
+        self.mav.mav.command_long_send(config.SYSID, config.COMPID,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0,0,0,0,0,0)
+        self.armed = False
+        print("🔒 已加锁")
 
     # ── 水泵控制 ───────────────────────────────────────────
 
@@ -270,10 +292,6 @@ class ROV:
         """入水泵 (1,3): 下潜时进水"""
         self.pump(config.PUMP_INLET1, state)
         self.pump(config.PUMP_INLET2, state)
-        if state:
-            print("💧 入水泵 ON")
-        else:
-            print("💧 入水泵 OFF")
 
     def pump_drains(self, state):
         """排水泵 (2,4): 上浮时排水（深度<0.1m气孔露出才启动）"""
@@ -283,165 +301,207 @@ class ROV:
             return
         self.pump(config.PUMP_DRAIN1, state)
         self.pump(config.PUMP_DRAIN2, state)
-        if state:
-            print("💧 排水泵 ON")
-        else:
-            print("💧 排水泵 OFF")
 
     def pumps_all_off(self):
         for i in range(1, 5):
             self.pump(i, False)
-        print("💧 所有水泵 OFF")
 
-    # ── 深度控制（含泵协同） ────────────────────────────────
+    # ── 中层控制原语 ────────────────────────────────────────
 
-    def hold_depth(self, target_m, duration=None):
-        """定深，带泵协同（0=水面, 正=水下深度）"""
+    def _send_rc(self, ch1=1500, ch2=1500, ch3=1500, ch4=1500, ch5=1500, ch6=1500, ch7=1500, ch8=1500):
+        """发送 RC override，自动处理翻转映射"""
+        if self.flip_state == config.FlipState.INVERTED:
+            ch3 = 3000 - ch3   # throttle 反号
+            ch2 = 3000 - ch2   # roll 反号
+            ch1 = 3000 - ch1   # pitch 反号
+            ch4 = 3000 - ch4   # yaw 反号
+            # ch5 forward 不变
+        self.mav.mav.rc_channels_override_send(config.SYSID, config.COMPID,
+                                                ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8)
+
+    def forward(self, sec=5, pwm_val=1580):
+        """直行 + pitch 保持 + yaw 锁定航向"""
+        self.pid_pitch.reset()
+        self.pid_yaw.reset()
+        self.pid_pitch.set_setpoint(0)
+        self.pid_pitch.kp, self.pid_pitch.kd = 0.05, 0.03
+        _, _, yaw0 = self.get_attitude()
+        target_yaw = yaw0 * 57.3
+        self.pid_yaw.set_setpoint(target_yaw)
+        self.pid_yaw.kp, self.pid_yaw.kd = 0.03, 0.05
+
+        deadline = time.time() + sec
+        while time.time() < deadline:
+            _, pitch_r, yaw_r = self.get_attitude()
+            pitch_d = pitch_r * 57.3
+            yaw_d = self._norm_yaw(yaw_r * 57.3, target_yaw)
+
+            # pitch: 水面允许 0~20° 仰头，水下严格保持 0°
+            if self.rov_mode == config.RovMode.SURFACE and 0 <= pitch_d <= 20:
+                p_out = 0.0
+                self.pid_pitch.reset()
+            else:
+                p_out = self.pid_pitch.update(pitch_d, config.CONTROL_DT,
+                                              velocity=self.get_sensor('pitchspeed'))
+
+            y_out = self.pid_yaw.update(yaw_d, config.CONTROL_DT,
+                                        velocity=self.get_sensor('yawspeed'))
+
+            ch1 = int(1500 + max(-1, min(1, p_out)) * 150)
+            ch4 = int(1500 + max(-1, min(1, y_out)) * 80)
+            self._send_rc(ch1=ch1, ch4=ch4, ch5=pwm_val)
+            time.sleep(config.CONTROL_DT)
+
+    def stop(self):
+        """全通道回中"""
+        self._send_rc()
+        time.sleep(0.3)
+
+    def turn_to(self, target_yaw, timeout=15):
+        """PD 闭环右转（EKF 角速度 D 项）"""
+        self.pid_yaw.reset()
+        self.pid_yaw.set_setpoint(target_yaw)
+        self.pid_yaw.kp, self.pid_yaw.ki, self.pid_yaw.kd = 0.03, 0.0, 0.05
+        print(f"  右转到 yaw={target_yaw:.0f}°")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, _, y_raw = self.get_attitude()
+            y_deg = self._norm_yaw(y_raw * 57.3, target_yaw)
+            err = target_yaw - y_deg
+            if abs(err) < 3: break
+            yaw_rate = self.get_sensor('yawspeed')
+            out = self.pid_yaw.update(y_deg, config.CONTROL_DT, velocity=yaw_rate)
+            ch4 = int(1500 + max(-1, min(1, out)) * 80)
+            self._send_rc(ch4=ch4)
+            time.sleep(config.CONTROL_DT)
+        self.stop()
+        print(f"   ✓")
+
+    def hold_yaw(self, target_yaw, sec=6):
+        """PD 航向保持（EKF 角速度 D 项）"""
+        self.pid_yaw.reset()
+        self.pid_yaw.set_setpoint(target_yaw)
+        self.pid_yaw.kp, self.pid_yaw.ki, self.pid_yaw.kd = 0.03, 0.0, 0.05
+        print(f"  保持 yaw={target_yaw:.0f}° {sec}s")
+        deadline = time.time() + sec
+        while time.time() < deadline:
+            _, _, y_raw = self.get_attitude()
+            y_deg = self._norm_yaw(y_raw * 57.3, target_yaw)
+            err = target_yaw - y_deg
+            if abs(err) < 3: time.sleep(config.CONTROL_DT); continue
+            yaw_rate = self.get_sensor('yawspeed')
+            out = self.pid_yaw.update(y_deg, config.CONTROL_DT, velocity=yaw_rate)
+            ch4 = int(1500 + max(-1, min(1, out)) * 80)
+            self._send_rc(ch4=ch4)
+            time.sleep(config.CONTROL_DT)
+        self.stop()
+        print(f"   ✓")
+
+    def hold_depth(self, target_m, duration=30):
+        """定深 + 全姿态 PD 稳定 + 水泵协同"""
+        # 重置 PID 并设目标
+        for pid in (self.pid_depth, self.pid_pitch, self.pid_roll, self.pid_yaw):
+            pid.reset()
         self.pid_depth.set_setpoint(target_m)
+        self.pid_depth.kp, self.pid_depth.ki, self.pid_depth.kd = 3.0, 0.1, 2.0
+        self.pid_pitch.set_setpoint(0); self.pid_pitch.kp, self.pid_pitch.kd = 0.05, 0.03
+        self.pid_roll.set_setpoint(0);  self.pid_roll.kp, self.pid_roll.kd = 0.06, 0.03
+        _, _, yaw0 = self.get_attitude()
+        target_yaw = yaw0 * 57.3
+        self.pid_yaw.set_setpoint(target_yaw)
+        self.pid_yaw.kp, self.pid_yaw.kd = 0.03, 0.05
+        print(f"  定深 {target_m}m 稳姿(yaw={target_yaw:.0f}°) {duration}s")
+        drains_on = False
 
-        # 下潜：切水下模式 + 启动入水泵
-        if target_m > self.get_depth():
+        # 循环前：下潜目标 → 切 UNDERWATER（上浮时保持 UNDERWATER，用垂直电机）
+        if target_m > 0.05 and self.rov_mode == config.RovMode.SURFACE:
             self.set_mode(config.RovMode.UNDERWATER)
-            self.pump_inlets(True)
 
-        deadline = time.time() + duration if duration else float('inf')
+        deadline = time.time() + duration
         while time.time() < deadline:
-            current = self.get_depth()
-            # 深度超过阈值时关闭入水泵
-            if current > config.PUMP_INLET_OFF_DEPTH:
-                self.pump_inlets(False)
-            vertical = self.pid_depth.update(current, config.CONTROL_DT)
-            self.set_raw(vertical=vertical)
-            time.sleep(config.CONTROL_DT)
-        self.pump_inlets(False)
-
-        # 接近水面自动切水面模式
-        if target_m < config.PUMP_DRAIN_DEPTH:
-            self.set_mode(config.RovMode.SURFACE)
-
-    # ── 紧急上浮 ───────────────────────────────────────────
-
-    def emergency_surface(self):
-        """紧急上浮：翻正 → 垂直上升 → 近水面排水 → 到达水面"""
-        print("🚨 紧急上浮!")
-        self.update_flip_state()
-        if self.flip_state == config.FlipState.INVERTED:
-            self.roll_to_normal()
-
-        # 全力上升
-        self.set_raw(vertical=1.0)
-        for _ in range(50):  # 约 5 秒
             depth = self.get_depth()
-            # 近水面时开排水泵
-            if depth < config.PUMP_DRAIN_DEPTH:
+            roll_r, pitch_r, yaw_r = self.get_attitude()
+            roll_d, pitch_d, yaw_d = roll_r * 57.3, pitch_r * 57.3, yaw_r * 57.3
+
+            # PD 计算（EKF 角速度 D 项）
+            d_out = self.pid_depth.update(depth, config.CONTROL_DT)
+            p_out = self.pid_pitch.update(pitch_d, config.CONTROL_DT,
+                                          velocity=self.get_sensor('pitchspeed'))
+            r_out = self.pid_roll.update(roll_d, config.CONTROL_DT,
+                                         velocity=self.get_sensor('rollspeed'))
+            y_deg = self._norm_yaw(yaw_d, target_yaw)
+            y_out = self.pid_yaw.update(y_deg, config.CONTROL_DT,
+                                        velocity=self.get_sensor('yawspeed'))
+
+            # PWM 输出
+            ch3 = int(1500 - max(-1, min(1, d_out)) * 120)
+            ch1 = int(1500 + max(-1, min(1, p_out)) * 150)
+            ch2 = int(1500 + max(-1, min(1, r_out)) * 100)
+            ch4 = int(1500 + max(-1, min(1, y_out)) * 80)
+
+            if depth > config.PUMP_INLET_OFF_DEPTH:
+                self.pump_inlets(False)
+            if depth < config.PUMP_DRAIN_DEPTH and target_m < depth and self.rov_mode == config.RovMode.UNDERWATER:
+                self.set_mode(config.RovMode.SURFACE)
+            if depth < config.PUMP_DRAIN_DEPTH and target_m < depth and not drains_on:
+                self.pump_drains(True); drains_on = True
+            if depth < 0.02 and drains_on:
+                self.pump_drains(False); drains_on = False
+
+            self._send_rc(ch1, ch2, ch3, ch4)
+            time.sleep(0.05)
+        self.stop()
+
+    def surface(self):
+        """上浮到水面"""
+        self.hold_depth(0.0, duration=30)
+
+    def dive_to(self, target_m):
+        """下潜：先切水下模式激活电机，水泵+电机并行协同下潜"""
+        self.set_mode(config.RovMode.UNDERWATER)  # 1. 激活全部 6 电机
+        self.pump_inlets(True)                    # 2. 开入水泵灌水
+        self.hold_depth(target_m, duration=10)   # 3. 电机 PID + 水泵并行，10s 下潜到位
+
+    # ── 排水循环（后台线程，仅水面模式） ──────────────────────
+
+    def _bilge_loop(self, interval=5, burst=1):
+        """后台：每 interval 秒开 burst 秒排水泵（仅 SURFACE 模式）"""
+        while self._bilge_running:
+            if self.rov_mode == config.RovMode.SURFACE:
                 self.pump_drains(True)
-            time.sleep(config.CONTROL_DT)
+                time.sleep(burst)
+                self.pump_drains(False)
+                time.sleep(interval - burst)
+            else:
+                time.sleep(1)  # 水下模式跳过，1 秒后再检查
 
-        self.set_mode(config.RovMode.SURFACE)
-        self.stop()
-        self.pumps_all_off()
-        print("✅ 已上浮")
+    def start_bilge(self, interval=5, burst=1):
+        """启动排水循环"""
+        if self._bilge_running: return
+        self._bilge_running = True
+        self._bilge_thread = threading.Thread(
+            target=self._bilge_loop, args=(interval, burst), daemon=True)
+        self._bilge_thread.start()
+        print(f"💧 排水循环启动: 每{interval}s开{burst}s (仅水面模式)")
 
-    # ── 高层命令 ───────────────────────────────────────────
+    def stop_bilge(self):
+        """停止排水循环"""
+        self._bilge_running = False
+        if self._bilge_thread:
+            self._bilge_thread.join(timeout=2)
+        print("💧 排水循环停止")
 
-    def arm(self, retries=3):
-        """解锁（通过后台读取线程检查状态，不直接读串口）"""
-        if self.mav is None:
-            return False
-        for _ in range(retries):
-            self.mav.mav.command_long_send(
-                config.SYSID, config.COMPID,
-                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
-                1, 0, 0, 0, 0, 0, 0)
-            time.sleep(2)
-            if self._heartbeat_armed:
-                self.armed = True
-                print("✅ 已解锁")
-                return True
-        print("❌ 解锁失败")
-        return False
-
-    def disarm(self):
-        """加锁"""
-        if self.mav is None:
-            return
-        self.mav.mav.command_long_send(
-            config.SYSID, config.COMPID,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
-            0, 0, 0, 0, 0, 0, 0)
-        self.armed = False
-        self._heartbeat_armed = False
-        print("🔒 已加锁")
-
-    def wait_heartbeat(self, timeout=5):
-        """等待心跳"""
-        self.mav.wait_heartbeat(timeout=timeout)
-
-    # ── 闭环控制 ───────────────────────────────────────────
-
-    def hold_depth(self, target_m, duration=None):
-        """定深 PID 控制"""
-        self.pid_depth.set_setpoint(target_m)
-        print(f"📏 定深 {target_m:.1f}m")
-        deadline = time.time() + duration if duration else float('inf')
-        while time.time() < deadline:
-            current = self.get_depth()
-            vertical = self.pid_depth.update(current, config.CONTROL_DT)
-            self.set_raw(vertical=vertical)
-            time.sleep(config.CONTROL_DT)
-
-    def hold_attitude(self, target_roll_deg=0, target_pitch_deg=0, target_yaw_deg=None, duration=None):
-        """姿态保持 PID"""
-        self.pid_roll.set_setpoint(target_roll_deg)
-        self.pid_pitch.set_setpoint(target_pitch_deg)
-        if target_yaw_deg is not None:
-            self.pid_yaw.set_setpoint(target_yaw_deg)
-
-        deadline = time.time() + duration if duration else float('inf')
-        while time.time() < deadline:
-            r, p, y = self.get_attitude()
-            roll_out = self.pid_roll.update(r * 57.2958, config.CONTROL_DT)
-            pitch_out = self.pid_pitch.update(p * 57.2958, config.CONTROL_DT)
-            yaw_out = self.pid_yaw.update(y * 57.2958, config.CONTROL_DT) if target_yaw_deg is not None else 0.0
-            self.set_raw(roll=roll_out, pitch=pitch_out, yaw=yaw_out)
-            time.sleep(config.CONTROL_DT)
-
-    def hold_yaw(self, target_deg):
-        """航向保持"""
-        self.hold_attitude(target_yaw_deg=target_deg)
-
-    def roll_to_normal(self):
-        """翻转回正常姿态（5,6 差速）"""
-        self.pid_roll.set_setpoint(0.0)
-        print("🔄 翻转回正...")
-        for _ in range(100):
-            r, p, y = self.get_attitude()
-            roll_out = self.pid_roll.update(r * 57.2958, config.CONTROL_DT)
-            self.set_raw(roll=roll_out)
-            time.sleep(config.CONTROL_DT)
-            self.update_flip_state()
-            if self.flip_state == config.FlipState.NORMAL:
-                print("✅ 已回正")
-                break
-
-    def emergency_surface(self):
-        """紧急上浮"""
-        print("🚨 紧急上浮!")
-        # 翻转回正
-        self.update_flip_state()
-        if self.flip_state == config.FlipState.INVERTED:
-            self.roll_to_normal()
-        # 全力上升
-        self.set_raw(vertical=1.0)
-        time.sleep(5)
-        self.set_mode(config.RovMode.SURFACE)
-        self.stop()
-        print("✅ 已上浮")
+    def _norm_yaw(self, y_deg, target):
+        """归一化 yaw 到 target±180"""
+        while y_deg < target - 180: y_deg += 360
+        while y_deg > target + 180: y_deg -= 360
+        return y_deg
 
     # ── 清理 ───────────────────────────────────────────────
 
     def close(self):
         self._reader_running = False
+        self.stop_bilge()
         if self._reader_thread:
             self._reader_thread.join(timeout=2)
         if self.armed:

@@ -143,28 +143,7 @@ m.mav.rc_channels_override_send(1, 1,
 
 ## 6. 后续工作
 
-### 立即
-- [ ] 俯仰方向测试 (ch1) — 确认 pitch 电机响应
-- [ ] 偏航方向测试 (ch4) — 确认左右转向
-- [ ] 升沉方向测试 (ch3) — 确认垂直推进器
-
-### 下水前
-- [ ] 读全部参数备份
-- [ ] 密封/防水
-- [x] 烧录 MOT_SURFACE_MODE 固件
-
 ### 下水后
-- [x] 通道验证（forward/yaw/roll/throttle/pitch 全部确认）
-- [x] 深度零点校准（启动自动记录水面气压）
-- [x] 水泵测试（RELAY 0/1/2/3, 0-based, 1,3进水 2,4排水）
-- [x] 正方形轨迹（分级PWM控制, 效果见下）
-- [ ] STABILIZE 稳姿态  
+- [ ] STABILIZE 稳姿态
 - [ ] ALT_HOLD 定深
-- [ ] 图传接入
-
-### 转向控制关键发现
-- **PID 不适合水下惯性系统**: D项在低速离散IMU下输出爆炸, 惯性+延迟导致过冲无法刹车
-- **分级PWM 成功**: 误差>40°→1580, >15°→1540, >5°→1510/刹车, <3°+低速→停
-- 上次测试: turn_to 误差-1°, hold_yaw ±5°内振荡, 反向纠正生效
-- 代码: mission.py 使用 rov.mav.mav.rc_channels_override_send 直接发送(不经过set_raw的锁竞争)
-- 水泵: MAV_CMD_DO_SET_RELAY 0-based编号
+- [ ] 轨迹脚本 (rc_override 方案)
